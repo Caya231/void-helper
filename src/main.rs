@@ -23,27 +23,37 @@ struct AurPackage {
 
 fn cli() -> Command {
     Command::new("void")
-        .about("A minimalist AUR helper")
-        .version("0.1")
-        .subcommand_required(true)
+        .about("Minimalist AUR helper")
+        .version("0.2")
         .arg_required_else_help(true)
+        .subcommand_required(true)
         .subcommand(
-            Command::new("install")
+            Command::new("sync")
+                .about("Synchronize packages")
                 .short_flag('S')
-                .about("Install a package")
-                .arg(Arg::new("package").required(true)),
+                .subcommand(
+                    Command::new("search")
+                        .about("Search packages")
+                        .short_flag('s')
+                        .arg(Arg::new("query").required(true)),
+                )
+                .subcommand(
+                    Command::new("install")
+                        .about("Install package")
+                        .arg(Arg::new("package").required(true)),
+                ),
         )
         .subcommand(
             Command::new("remove")
+                .about("Remove package")
                 .short_flag('R')
-                .about("Remove a package")
                 .arg(Arg::new("package").required(true)),
         )
 }
 
 async fn get_package_info(package: &str) -> Result<Option<AurPackage>, Box<dyn std::error::Error>> {
-    let info_url = format!("https://aur.archlinux.org/rpc/?v=5&type=info&arg[]={}", package);
-    let response = reqwest::get(&info_url).await?.json::<AurResponse>().await?;
+    let url = format!("https://aur.archlinux.org/rpc/?v=5&type=info&arg[]={}", package);
+    let response = reqwest::get(&url).await?.json::<AurResponse>().await?;
     Ok(response.results.into_iter().next())
 }
 
@@ -51,31 +61,68 @@ async fn search_packages(query: &str) -> Result<Vec<AurPackage>, Box<dyn std::er
     let url = format!("https://aur.archlinux.org/rpc/?v=5&type=search&arg={}", query);
     let response = reqwest::get(&url).await?.json::<AurResponse>().await?;
     
-    let filtered = response.results.into_iter()
+    // Advanced filtering for better relevance
+    let query_lower = query.to_lowercase();
+    let filtered: Vec<AurPackage> = response.results
+        .into_iter()
         .filter(|pkg| {
-            let name = pkg.name.to_lowercase();
-            let query = query.to_lowercase();
-            name.starts_with(&query) ||
-            name.split('-').any(|part| part == query) ||
-            name.split('_').any(|part| part == query)
+            let name_lower = pkg.name.to_lowercase();
+            
+            // Exact match gets highest priority
+            if name_lower == query_lower {
+                return true;
+            }
+            
+            // Starts with query
+            if name_lower.starts_with(&query_lower) {
+                return true;
+            }
+            
+            // Contains query as whole word
+            if name_lower.split(|c: char| !c.is_alphanumeric())
+                .any(|word| word == query_lower) {
+                return true;
+            }
+            
+            false
         })
         .collect();
     
     Ok(filtered)
 }
 
+async fn show_search_results(query: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let packages = search_packages(query).await?;
+    
+    if packages.is_empty() {
+        println!("{} {}", "No packages found for:".red(), query);
+        return Ok(());
+    }
+
+    println!("{} {}", "Found packages:".green(), query.bold());
+    
+    // Show max 8 most relevant results
+    for pkg in packages.iter().take(8) {
+        println!("{} - {}",
+            pkg.name.bright_green().bold(),
+            pkg.description.as_deref().unwrap_or("No description").dimmed()
+        );
+    }
+
+    Ok(())
+}
+
 async fn install_package(package: &str) -> Result<(), Box<dyn std::error::Error>> {
     match get_package_info(package).await? {
         Some(pkg) => {
-            println!("{} {}", "Installing:".green(), pkg.name);
+            println!("{} {}", "Installing:".bright_green(), pkg.name.bold());
             
             let build_dir = dirs::home_dir()
                 .unwrap()
-                .join("aur-builds")
+                .join(".void-builds")
                 .join(&pkg.package_base);
             
             if build_dir.exists() {
-                println!("{} {}", "Removing existing directory:".yellow(), build_dir.display());
                 fs::remove_dir_all(&build_dir)?;
             }
 
@@ -83,55 +130,34 @@ async fn install_package(package: &str) -> Result<(), Box<dyn std::error::Error>
 
             let aur_url = format!("https://aur.archlinux.org/{}.git", pkg.package_base);
             
-            let git_status = StdCommand::new("git")
+            if !StdCommand::new("git")
                 .arg("clone")
                 .arg(&aur_url)
                 .arg(&build_dir)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status()?;
-
-            if !git_status.success() {
+                .status()?
+                .success() {
                 eprintln!("{}", "Failed to clone repository".red());
                 return Ok(());
             }
 
-            let makepkg = StdCommand::new("makepkg")
+            let status = StdCommand::new("makepkg")
                 .arg("-si")
                 .current_dir(&build_dir)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status();
+                .status()?;
 
-            match makepkg {
-                Ok(status) if status.success() => {
-                    println!("{} {}", "Successfully installed:".green(), pkg.name.bold());
-                }
-                _ => {
-                    eprintln!("{}", "First attempt failed, trying with PGP check skip...".yellow());
-                    
-                    let status = StdCommand::new("makepkg")
-                        .arg("-si")
-                        .arg("--skippgpcheck")
-                        .current_dir(&build_dir)
-                        .stdout(Stdio::inherit())
-                        .stderr(Stdio::inherit())
-                        .status()?;
-                    
-                    if !status.success() {
-                        eprintln!("{}", "Failed to build and install package".red());
-                        eprintln!("{}", "You may need to manually import PGP keys:".yellow());
-                        eprintln!("{}", "Look for any missing key IDs in the error messages above".cyan());
-                        eprintln!("{}", "Then run: gpg --recv-keys <KEY_ID>".cyan());
-                    } else {
-                        println!("{} {}", "Successfully installed with PGP check skip:".yellow(), pkg.name.bold());
-                    }
-                }
+            if !status.success() {
+                eprintln!("{}", "Installation failed".red());
+            } else {
+                println!("{} {}", "Success:".bright_green(), pkg.name.bold());
             }
         }
         None => {
-            println!("{} {}", "Package not found in AUR:".red(), package);
-            suggest_similar_packages(package).await?;
+            println!("{} {}", "Package not found:".red(), package);
+            show_search_results(package).await?;
         }
     }
 
@@ -139,7 +165,7 @@ async fn install_package(package: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 async fn remove_package(package: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{} {}", "Removing package:".yellow(), package);
+    println!("{} {}", "Removing:".yellow(), package.bold());
     
     let status = StdCommand::new("sudo")
         .arg("pacman")
@@ -150,30 +176,9 @@ async fn remove_package(package: &str) -> Result<(), Box<dyn std::error::Error>>
         .status()?;
 
     if !status.success() {
-        eprintln!("{}", "Failed to remove package".red());
+        eprintln!("{}", "Removal failed".red());
     } else {
-        println!("{} {}", "Successfully removed:".green(), package.bold());
-    }
-
-    Ok(())
-}
-
-async fn suggest_similar_packages(query: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", "Searching for similar packages...".yellow());
-    
-    let packages = search_packages(query).await?;
-    
-    if packages.is_empty() {
-        println!("{}", "No similar packages found.".red());
-        return Ok(());
-    }
-
-    println!("{}", "Did you mean:".yellow());
-    for (i, pkg) in packages.iter().take(5).enumerate() {
-        println!("{}. {} - {}", 
-            i + 1, 
-            pkg.name.green(), 
-            pkg.description.as_deref().unwrap_or("No description").dimmed());
+        println!("{} {}", "Removed:".bright_green(), package.bold());
     }
 
     Ok(())
@@ -184,15 +189,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = cli().get_matches();
 
     match matches.subcommand() {
-        Some(("install", sub_matches)) => {
-            let package = sub_matches.get_one::<String>("package").unwrap();
-            install_package(package).await?;
+        Some(("sync", sync_matches)) => match sync_matches.subcommand() {
+            Some(("search", search_matches)) => {
+                show_search_results(search_matches.get_one::<String>("query").unwrap()).await?
+            }
+            Some(("install", install_matches)) => {
+                install_package(install_matches.get_one::<String>("package").unwrap()).await?
+            }
+            _ => eprintln!("{}", "Invalid sync command".red()),
+        },
+        Some(("remove", remove_matches)) => {
+            remove_package(remove_matches.get_one::<String>("package").unwrap()).await?
         }
-        Some(("remove", sub_matches)) => {
-            let package = sub_matches.get_one::<String>("package").unwrap();
-            remove_package(package).await?;
-        }
-        _ => unreachable!(),
+        _ => eprintln!("{}", "Invalid command".red()),
     }
 
     Ok(())
